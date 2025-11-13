@@ -8,6 +8,8 @@
 #include <string>
 #include <set>
 #include <list>
+#include <mutex>
+#include <variant>
 
 #include "ViewBase.h"
 #include "keybindings.h"
@@ -76,6 +78,23 @@ struct KeyEvent {
   EventMatch match;
 };
 
+struct ModstateInput {
+  int bit = 0;
+  int val = 0;
+};
+
+struct QuitInput {};
+struct ClearInput {};
+
+struct QueuedInput {
+  Uint32 time;
+  std::variant<ModstateInput, KeyEvent, QuitInput, ClearInput> val;
+};
+
+extern std::mutex input_queue_lock;
+extern std::vector<QueuedInput> input_queue;
+extern std::vector<QueuedInput> backlog;
+
 typedef std::list<std::set<InterfaceKey> > macro;
 
 struct RegisteredKey {
@@ -91,6 +110,10 @@ class enabler_inputst {
   void load_macro_from_file(const std::string &file);
   void save_macro_to_file(const std::string &file, const std::string &name, const macro &);
   
+  // Apply a queued input
+  void apply_queued_input(QueuedInput& in);
+  // Add queued input
+  void queue_input(QueuedInput& in);
   // In practice.. do not use this one.
   void add_input(SDL_Event &e, Time now);
   // Use this one. It's much nicer.

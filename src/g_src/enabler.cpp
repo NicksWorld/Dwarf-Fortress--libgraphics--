@@ -708,18 +708,22 @@ void enablerst::pause_async_loop()  {
   struct async_cmd cmd;
   cmd.cmd = async_cmd::pause;
   async_tobox.write(cmd);
-  async_wait();
+  async_process(true);
 }
 
 // Wait until the previous command has been acknowledged, /or/
 // async_loop has quit. Incidentally execute any requests in the
 // meantime.
-void enablerst::async_wait() {
+void enablerst::async_process(bool wait) {
   if (loopvar == 0) return;
   async_msg r;
   bool reset_textures = false;
   for (;;) {
-    async_frombox.read(r);
+    if (wait) {
+      async_frombox.read(r);
+    } else {
+      if (!async_frombox.try_read(r)) break;
+    }
     switch (r.msg) {
     case async_msg::quit:
       loopvar = 0;
@@ -764,6 +768,18 @@ void enablerst::async_loop() {
   //int total_frames = 0;
   int fps = 100; // Just a thread-local copy // what?
   for (;;) {
+	  // Main input list depleted, check for new inputs
+	if (input_queue.size() == 0) {
+		input_queue_lock.lock();
+		std::swap(input_queue, backlog);
+		input_queue_lock.unlock();
+	}
+
+	// Process all inputs queued.
+	for (auto& ev : input_queue) {
+		enabler.apply_queued_input(ev);
+	}
+	input_queue.clear();
     // cout << "FRAMES: " << frames << endl;
     // Check for commands
     async_cmd cmd;
@@ -790,6 +806,9 @@ void enablerst::async_loop() {
           if (flag & ENABLERFLAG_RENDER) {
 
             //total_frames++;
+	    // Only one frame is queued at a time, only rendering then requeueing
+	    // after the frame_ready_event is received, meaning we are never
+	    // rendering whilst swapping arrays.
             renderer->swap_arrays();
 			/*
             if (total_frames % 1800 == 0)
@@ -799,7 +818,7 @@ void enablerst::async_loop() {
             flag &= ~ENABLERFLAG_RENDER;
             update_gfps();
           }
-	  // Push frame ready event into sdl event queue
+	  // Inform SDL_eventloop it is time to draw
 	  SDL_Event ev;
 	  SDL_zero(ev);
 	  ev.type = frame_ready_event;
@@ -841,6 +860,56 @@ void enablerst::async_loop() {
 }
 
 void enablerst::do_frame() {
+	if(gps.main_thread_requesting_reshape)
+		{
+		int32_t zf=gps.viewport_zoom_factor;
+
+		renderer->set_viewport_zoom_factor(zf);
+
+		gps.reshape_viewports(zf);
+
+		gps.main_thread_requesting_reshape=false;
+		}
+
+	if(!must_do_render_things_before_display)
+		{
+		if(gps.do_post_init_texture_clear)//needs to be after clean tile cache
+			{
+			enabler.textures.delete_all_post_init_textures();
+
+			gps.do_post_init_texture_clear=false;
+			}
+
+		if(gps.do_clean_tile_cache)
+			{
+			renderer->clean_tile_cache();
+
+			gps.do_clean_tile_cache=false;
+			}
+		renderer->tidy_tile_cache();
+		renderer->display();
+		renderer->render();
+		}
+    gputicks++;
+    outstanding_gframes--;
+
+    // Check for zoom commands here to ensure async_loop is not actively rendering
+    // Check for zoom commands
+    zoom_commands zoom;
+    while (async_zoom.try_read(zoom)) {
+      if (overridden_grid_sizes.size())
+	continue; // No zooming in movies
+      if (zoom == zoom_fullscreen)
+	renderer->set_fullscreen();
+      else
+	renderer->zoom(zoom);
+    }
+
+	// Allow another frame to be queued, now that this one is rendered
+	frame_queued = false;
+}
+
+void enablerst::queue_frame() {
   // Check how long it's been, exactly
   const Uint32 now = SDL_GetTicks();
   const Uint32 interval = CLAMP(now - last_tick, 0, 1000); // Anything above a second doesn't count
@@ -885,7 +954,7 @@ void enablerst::do_frame() {
 
 void enablerst::eventLoop_SDL()
 {
-  
+  QueuedInput in;
   SDL_Event event;
   Uint32 mouse_lastused = 0;
   SDL_ShowCursor(SDL_DISABLE);
@@ -908,42 +977,22 @@ void enablerst::eventLoop_SDL()
 	bool already_wheeled = false;
     bool paused_loop = false;
 
-    // Check for zoom commands
-    zoom_commands zoom;
-    while (async_zoom.try_read(zoom)) {
-      if (overridden_grid_sizes.size())
-        continue; // No zooming in movies
-      if (!paused_loop) {
-        pause_async_loop();
-        paused_loop = true;
-      }
-      if (zoom == zoom_fullscreen)
-        renderer->set_fullscreen();
-      else
-        renderer->zoom(zoom);
-    }
-    if (paused_loop) {
-	    unpause_async_loop();
-	    paused_loop = false;
-    }
 
 	bool any_text_event=false;
 
+	// Process any async_loop messages, as we are no longer pausing the async_loop
+	// constantly
+	async_process(false);
+
     // Check for SDL events
     while (SDL_PollEvent(&event)) {
-      // Make sure mainloop isn't running while we're processing input
-      // if (!paused_loop) {
-        // pause_async_loop();
-        // paused_loop = true;
-      // }
 	  if (hooks_sdl_event(&event)) continue;
       // Handle SDL events
       switch (event.type) {
 	  case SDL_MOUSEWHEEL:
 		  if (!already_wheeled) {
 			  already_wheeled = true;
-			  // enabler.add_input(event, now);
-			  send_event(event, now);
+			  enabler.add_input(event, now);
 		  }
 		  break;
 	  case SDL_KEYDOWN:
@@ -957,13 +1006,12 @@ void enablerst::eventLoop_SDL()
           SDL_ShowCursor(SDL_DISABLE);
         }
       case SDL_KEYUP:
-	  case SDL_QUIT:
-        // enabler.add_input(event, now);
-	send_event(event, now);
+      case SDL_QUIT:
+	enabler.add_input(event, now);
         break;
-	  case SDL_TEXTINPUT:
+      case SDL_TEXTINPUT:
+	// TODO: Needs add_input case
 	send_event(event, now);
-		any_text_event=true;
 		break;
       case SDL_MOUSEBUTTONDOWN:
       case SDL_MOUSEBUTTONUP:
@@ -987,8 +1035,7 @@ void enablerst::eventLoop_SDL()
             if (!isdown)
               enabler.mouse_mbut_lift = 0;
           } else
-		  send_event(event, now);
-            // enabler.add_input(event, now);
+            enabler.add_input(event, now);
         }
         break;
       case SDL_MOUSEMOTION:
@@ -1010,7 +1057,9 @@ void enablerst::eventLoop_SDL()
         }
         break;
       case SDL_WINDOWEVENT:
-        enabler.clear_input();
+	in.val = ClearInput {};
+	in.time = now;
+	enabler.queue_input(in);
 		switch (event.window.event) {
 			case SDL_WINDOWEVENT_SHOWN:
 				enabler.flag |= ENABLERFLAG_RENDER;
@@ -1021,12 +1070,17 @@ void enablerst::eventLoop_SDL()
 				enabler.flag |= ENABLERFLAG_RENDER;
 				break;
 			case SDL_WINDOWEVENT_RESIZED:
-				if (is_fullscreen());
+				// Resizing while in fullscreen can happen with
+				// tiled window managers (ex. i3wm) which can override window
+				// size and toggle fullscreen at any time.
+				// As such, it is correct to allow resizing whilst in fullscreen
+				// if (is_fullscreen());
 				//errorlog << "Caught resize event in fullscreen??\n";
-				else {
+				// else {
 					//gamelog << "Resizing window to " << event.resize.w << "x" << event.resize.h << endl << flush;
+					// TODO: Needs to be queued to occur immediately after frame display
 					renderer->resize(event.window.data1, event.window.data2);
-				}
+				// }
 				break;
 			case SDL_WINDOWEVENT_ENTER:
 				mouse_focus = true;
@@ -1038,39 +1092,7 @@ void enablerst::eventLoop_SDL()
 		break;
       } // switch (event.type)
 	if (event.type == frame_ready_event) {
-		frame_queued = false;
-		if(gps.main_thread_requesting_reshape)
-			{
-			int32_t zf=gps.viewport_zoom_factor;
-
-			renderer->set_viewport_zoom_factor(zf);
-
-			gps.reshape_viewports(zf);
-
-			gps.main_thread_requesting_reshape=false;
-			}
-
-		if(!must_do_render_things_before_display)
-			{
-			if(gps.do_post_init_texture_clear)//needs to be after clean tile cache
-				{
-				enabler.textures.delete_all_post_init_textures();
-
-				gps.do_post_init_texture_clear=false;
-				}
-
-			if(gps.do_clean_tile_cache)
-				{
-				renderer->clean_tile_cache();
-
-				gps.do_clean_tile_cache=false;
-				}
-			renderer->tidy_tile_cache();
-			renderer->display();
-			renderer->render();
-			}
-	    gputicks++;
-	    outstanding_gframes--;
+		do_frame();
 	}
     } //while have event
 
@@ -1108,7 +1130,7 @@ void enablerst::eventLoop_SDL()
       unpause_async_loop();
 
     hooks_sdl_loop_fn();
-    do_frame();
+    queue_frame();
 
 #ifndef NO_FMOD
 	musicsound.update();

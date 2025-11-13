@@ -910,7 +910,8 @@ class enablerst : public enabler_inputst
  private:
 	 
   void pause_async_loop();
-  void async_wait();
+  // Poll for events from async_loop, processing them, returning bool if event was received.
+  void async_process(bool wait);
   void unpause_async_loop() {
     struct async_cmd cmd;
     cmd.cmd = async_cmd::start;
@@ -928,6 +929,7 @@ class enablerst : public enabler_inputst
   int loop(string cmdline);
   void async_loop();
   void do_frame();
+  void queue_frame();
   
   // Framerate interface
   void set_fps(int fps);

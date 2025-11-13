@@ -20,6 +20,10 @@ extern initst init;
 #endif
 using namespace std;
 
+std::mutex input_queue_lock; // Used to protect the swap
+std::vector<QueuedInput> input_queue; // Queue being read by async_loop
+std::vector<QueuedInput> backlog; // Queue being written by eventloop_SDL
+
 // The timeline events we actually pass back from get_input. Well, no,
 // that's just k, but..
 struct Event {
@@ -68,7 +72,7 @@ struct less_sz {
 static int last_serial = 0; // Input serial number, to differentiate distinct physical presses
 static set<Event> timeline; // A timeline of pending key events (for next get_input)
 static set<EventMatch> pressed_keys; // Keys we consider "pressed"
-static int modState; // Modifier state
+static int modState; // Modifier state;
   
 // These do not change as part of the normal dynamics of DF, only at startup/when editing.
 static multimap<EventMatch,InterfaceKey> keymap;
@@ -517,22 +521,64 @@ void enabler_inputst::save_keybindings() {
   save_keybindings("prefs/interface.txt");
 }
 
-void enabler_inputst::add_input(SDL_Event &e, Uint32 now) {
-  // Before we can use this input, there are some issues to deal with:
-  // - SDL provides unicode translations only for key-press events, not
-  //   releases. We need to keep track of pressed keys, and generate
-  //   unicode release events whenever any modifiers are hit, or if
-  //   that raw keycode is released.
-  // - Generally speaking, when modifiers are hit/released, we discard those
-  //   events and generate press/release events for all pressed non-modifiers.
-  // - It's possible for multiple events to be generated on the same tick.
-  //   These are of course separate keypresses, and must be kept separate.
-  //   That's what the serial is for.
-
-  set<EventMatch>::iterator pkit;
+// Based on original enabler_inputst::add_input, just applying non-sdl_event input
+void enabler_inputst::apply_queued_input(QueuedInput& in) {
   list<pair<KeyEvent, int> > synthetics;
-  update_modstate(e);
-  
+
+  if (std::holds_alternative<ModstateInput>(in.val)) {
+    auto& mod_in = std::get<ModstateInput>(in.val);
+    if (mod_in.val) {
+      modState |= mod_in.bit;
+    } else {
+      modState &= ~mod_in.bit;
+    }
+    for (auto& pressed : pressed_keys) {
+      KeyEvent synth;
+      synth.release = true;
+      synth.match = pressed;
+      synthetics.push_back(make_pair(synth, next_serial()));
+
+      // Repress with modifiers
+      synth.release = false;
+      synth.match.mod = getModState();
+      if (!key_registering) {
+        synthetics.push_back(make_pair(synth, next_serial()));
+      }
+    }
+  } else if (std::holds_alternative<KeyEvent>(in.val)) {
+    auto& key_in = std::get<KeyEvent>(in.val);
+    // Non-modstate keypress
+    const int serial = next_serial();
+
+    key_in.match.mod = getModState();
+    synthetics.push_back(make_pair(key_in, next_serial()));
+  } else if (std::holds_alternative<QuitInput>(in.val)) {
+    Event e = { REPEAT_NOT, (InterfaceKey)INTERFACEKEY_OPTIONS, 0, (int)next_serial(), (int) in.time, 0 };
+    timeline.insert(e);
+    return;
+  } else if (std::holds_alternative<ClearInput>(in.val)) {
+    clear_input();
+    return;
+  }
+
+  for (auto& lit : synthetics) {
+    if (lit.first.release) pressed_keys.erase(lit.first.match);
+    else pressed_keys.insert(lit.first.match);
+
+    add_input_refined(lit.first, in.time, lit.second);
+  }
+}
+
+void enabler_inputst::queue_input(QueuedInput& input) {
+  input_queue_lock.lock();
+  backlog.push_back(input);
+  input_queue_lock.unlock();
+}
+
+// Now adds a QueuedInput to backlog
+void enabler_inputst::add_input(SDL_Event &e, Uint32 now) {
+  QueuedInput out;
+  out.time = now;
   // Convert modifier state changes
   if ((e.type == SDL_KEYUP || e.type == SDL_KEYDOWN) &&
       (e.key.keysym.sym == SDLK_RSHIFT ||
@@ -541,18 +587,26 @@ void enabler_inputst::add_input(SDL_Event &e, Uint32 now) {
        e.key.keysym.sym == SDLK_LCTRL  ||
        e.key.keysym.sym == SDLK_RALT   ||
        e.key.keysym.sym == SDLK_LALT   )) {
-    for (pkit = pressed_keys.begin(); pkit != pressed_keys.end(); ++pkit) {
-      // Release currently pressed keys
-      KeyEvent synth;
-      synth.release = true;
-      synth.match = *pkit;
-      synthetics.push_back(make_pair(synth, next_serial()));
-      // Re-press them, with new modifiers, if they aren't unicode. We can't re-translate unicode.
-    synth.release = false;
-    synth.match.mod = getModState();
-    if (!key_registering) // We don't want extras when registering keys
-        synthetics.push_back(make_pair(synth, next_serial()));
+    int bit = 0;
+    switch(e.key.keysym.sym) {
+      case SDLK_RSHIFT:
+      case SDLK_LSHIFT:
+        bit = 1;
+        break;
+      case SDLK_RCTRL:
+      case SDLK_LCTRL:
+        bit = 2;
+        break;
+      case SDLK_RALT:
+      case SDLK_LALT:
+        bit = 4;
+        break;
     }
+    ModstateInput mod;
+    mod.bit = bit;
+    mod.val = e.type == SDL_KEYDOWN;
+
+    out.val = mod;
   } else {
     
     // Since it's not a modifier, we also pass on symbolic/button
@@ -564,43 +618,40 @@ void enabler_inputst::add_input(SDL_Event &e, Uint32 now) {
 
     KeyEvent real;
     real.release = (e.type == SDL_KEYUP || e.type == SDL_MOUSEBUTTONUP) ? true : false;
-    real.match.mod = getModState();
+    // real.match.mod = getModState();
     switch (e.type) {
         case SDL_MOUSEWHEEL:
             real.match.type = type_mwheel;
             real.match.scancode = 0;
             real.match.y = e.wheel.y * ((e.wheel.direction == SDL_MOUSEWHEEL_NORMAL) ? 1 : -1);
-            synthetics.push_back(make_pair(real, serial));
+            out.val = real;
             break;
         case SDL_MOUSEBUTTONUP:
         case SDL_MOUSEBUTTONDOWN:
             real.match.type = type_button;
             real.match.scancode = 0;
             real.match.button = e.button.button;
-            synthetics.push_back(make_pair(real, serial));
+            out.val = real;
             break;
         case SDL_KEYUP:
         case SDL_KEYDOWN:
             real.match.type = type_key;
             real.match.scancode = e.key.keysym.scancode;
             real.match.key = e.key.keysym.sym;
-            synthetics.push_back(make_pair(real, serial));
+            out.val = real;
             break;
         case SDL_QUIT:
-            // This one, we insert directly into the timeline.
-            Event e = { REPEAT_NOT, (InterfaceKey)INTERFACEKEY_OPTIONS, 0, (int)next_serial(), (int)now, 0 };
-            timeline.insert(e);
+            QuitInput quit;
+            out.val = quit;
+            break;
+        default:
+            return;
     }
   }
 
-  list<pair<KeyEvent, int> >::iterator lit;
-  for (lit = synthetics.begin(); lit != synthetics.end(); ++lit) {
-    // Add or remove the key from pressed_keys, keeping that up to date
-    if (lit->first.release) pressed_keys.erase(lit->first.match);
-    else pressed_keys.insert(lit->first.match);
-    // And pass the event on deeper.
-    add_input_refined(lit->first, now, lit->second);
-  }
+  input_queue_lock.lock();
+  backlog.push_back(out);
+  input_queue_lock.unlock();
 }
 
 // Input encoding:
