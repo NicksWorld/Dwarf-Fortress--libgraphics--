@@ -80,15 +80,30 @@ struct KeyEvent {
 
 struct ModstateInput {
   int bit = 0;
-  int val = 0;
+  bool val = 0;
+};
+
+struct TextInput {
+  char text[32];
 };
 
 struct QuitInput {};
 struct ClearInput {};
 
+struct MouseButton {
+  int which;
+  bool down;
+};
+
+struct MousePosition {
+  char tracking_on;
+  int mouse_x, mouse_y;
+  int pmouse_x, pmouse_y;
+};
+
 struct QueuedInput {
   Uint32 time;
-  std::variant<ModstateInput, KeyEvent, QuitInput, ClearInput> val;
+  std::variant<ModstateInput, KeyEvent, QuitInput, ClearInput, TextInput, MouseButton, MousePosition> val;
 };
 
 extern std::mutex input_queue_lock;

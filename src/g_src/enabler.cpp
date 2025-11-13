@@ -831,14 +831,6 @@ void enablerst::async_loop() {
         case async_cmd::set_fps:
           fps = cmd.val;
           break;
-	case async_cmd::input:
-	  InputEvent* iv = (InputEvent*)cmd.val;
-	  if (ev.type == SDL_TEXTINPUT) {
-		  enabler.set_text_input(iv->ev);
-	  } else {
-		  enabler.add_input(iv->ev, iv->now);
-	  }
-	  delete iv;
         }
       }
     } while (have_cmd);
@@ -858,6 +850,10 @@ void enablerst::async_loop() {
 	hooks_update();
   }
 }
+
+// Should probably be part of enablerst
+bool resize_queued = false;
+int resize_w, resize_h;
 
 void enablerst::do_frame() {
 	if(gps.main_thread_requesting_reshape)
@@ -893,6 +889,11 @@ void enablerst::do_frame() {
     gputicks++;
     outstanding_gframes--;
 
+    if (resize_queued) {
+	    renderer->resize(resize_w, resize_h);
+	    resize_queued = false;
+    }
+
     // Check for zoom commands here to ensure async_loop is not actively rendering
     // Check for zoom commands
     zoom_commands zoom;
@@ -908,6 +909,7 @@ void enablerst::do_frame() {
 	// Allow another frame to be queued, now that this one is rendered
 	frame_queued = false;
 }
+
 
 void enablerst::queue_frame() {
   // Check how long it's been, exactly
@@ -955,6 +957,10 @@ void enablerst::queue_frame() {
 void enablerst::eventLoop_SDL()
 {
   QueuedInput in;
+  TextInput textin;
+  MouseButton mb;
+  MousePosition mp;
+
   SDL_Event event;
   Uint32 mouse_lastused = 0;
   SDL_ShowCursor(SDL_DISABLE);
@@ -963,19 +969,9 @@ void enablerst::eventLoop_SDL()
   // Initialize the grid
   renderer->resize(window_w, window_h);
 
-  auto send_event = [this](SDL_Event& ev, Uint32 now) {
-	InputEvent* cp = new InputEvent();
-	cp->ev = ev;
-	cp->now = now;
-	async_cmd cmd(async_cmd::cmd_t::input);
-	cmd.val = (long)cp;
-	async_tobox.write(cmd);
-  };
-
   while (loopvar) {
     Uint32 now = SDL_GetTicks();
 	bool already_wheeled = false;
-    bool paused_loop = false;
 
 
 	bool any_text_event=false;
@@ -1010,30 +1006,24 @@ void enablerst::eventLoop_SDL()
 	enabler.add_input(event, now);
         break;
       case SDL_TEXTINPUT:
-	// TODO: Needs add_input case
-	send_event(event, now);
+	in.time = now;
+	memcpy(textin.text, event.text.text, 32);
+	in.val = textin;
+	enabler.queue_input(in);
 		break;
       case SDL_MOUSEBUTTONDOWN:
       case SDL_MOUSEBUTTONUP:
         if (!init.input.flag.has_flag(INIT_INPUT_FLAG_MOUSE_OFF)) {
           int isdown = (event.type == SDL_MOUSEBUTTONDOWN);
 
-	  // TODO: These lbut/rbut/lbut_down/rbut_down changes should be an event
-          if (event.button.button == SDL_BUTTON_LEFT) {
-            enabler.mouse_lbut = isdown;
-            enabler.mouse_lbut_down = isdown;
-            if (!isdown)
-              enabler.mouse_lbut_lift = 0;
-          } else if (event.button.button == SDL_BUTTON_RIGHT) {
-            enabler.mouse_rbut = isdown;
-            enabler.mouse_rbut_down = isdown;
-            if (!isdown)
-              enabler.mouse_rbut_lift = 0;
-          } else if (event.button.button == SDL_BUTTON_MIDDLE) {
-            enabler.mouse_mbut = isdown;
-            enabler.mouse_mbut_down = isdown;
-            if (!isdown)
-              enabler.mouse_mbut_lift = 0;
+	  if (event.button.button == SDL_BUTTON_LEFT
+		|| event.button.button == SDL_BUTTON_RIGHT
+		|| event.button.button == SDL_BUTTON_MIDDLE) {
+		mb.which = event.button.button;
+		mb.down = isdown;
+		in.time = now;
+		in.val = mb;
+		enabler.queue_input(in);
           } else
             enabler.add_input(event, now);
         }
@@ -1078,8 +1068,10 @@ void enablerst::eventLoop_SDL()
 				//errorlog << "Caught resize event in fullscreen??\n";
 				// else {
 					//gamelog << "Resizing window to " << event.resize.w << "x" << event.resize.h << endl << flush;
-					// TODO: Needs to be queued to occur immediately after frame display
-					renderer->resize(event.window.data1, event.window.data2);
+					// renderer->resize(event.window.data1, event.window.data2);
+					resize_queued = true;
+					resize_w = event.window.data1;
+					resize_h = event.window.data2;
 				// }
 				break;
 			case SDL_WINDOWEVENT_ENTER:
@@ -1113,21 +1105,18 @@ void enablerst::eventLoop_SDL()
 			precise_mouse_y!=gps.precise_mouse_y||
 			mouse_state!=enabler.tracking_on)
 			{
-			// Pause rendering loop and update values
-			if (!paused_loop) {
-			  pause_async_loop();
-			  paused_loop = true;}
+			
+			mp.tracking_on=mouse_state;
+			mp.mouse_x=mouse_x;
+			mp.mouse_y=mouse_y;
+			mp.pmouse_x=precise_mouse_x;
+			mp.pmouse_y=precise_mouse_y;
 
-			enabler.tracking_on=mouse_state;
-			gps.mouse_x=mouse_x;
-			gps.mouse_y=mouse_y;
-			gps.precise_mouse_x=precise_mouse_x;
-			gps.precise_mouse_y=precise_mouse_y;
+			in.time = now;
+			in.val = mp;
+			enabler.queue_input(in);
 			}
 		}
-
-    if (paused_loop)
-      unpause_async_loop();
 
     hooks_sdl_loop_fn();
     queue_frame();

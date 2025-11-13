@@ -559,7 +559,39 @@ void enabler_inputst::apply_queued_input(QueuedInput& in) {
   } else if (std::holds_alternative<ClearInput>(in.val)) {
     clear_input();
     return;
+  } else if (std::holds_alternative<TextInput>(in.val)) {
+    // TODO: This really shouldn't be owned by the core enabler, right?
+    std::memcpy(enabler.last_text_input.data(), std::get<TextInput>(in.val).text, 32);
+  } else if (std::holds_alternative<MouseButton>(in.val)) {
+    auto& mb = std::get<MouseButton>(in.val);
+    switch (mb.which) {
+    case SDL_BUTTON_LEFT:
+      enabler.mouse_lbut = mb.down;
+      enabler.mouse_lbut_down = mb.down;
+      if (!mb.down)
+        enabler.mouse_lbut_lift = 0;
+      break;
+    case SDL_BUTTON_RIGHT:
+      enabler.mouse_rbut = mb.down;
+      enabler.mouse_rbut_down = mb.down;
+      if (!mb.down)
+        enabler.mouse_rbut_lift = 0;
+      break;
+    case SDL_BUTTON_MIDDLE:
+      enabler.mouse_mbut = mb.down;
+      enabler.mouse_mbut_down = mb.down;
+      if (!mb.down)
+        enabler.mouse_mbut_lift = 0;
+    }
+  } else if (std::holds_alternative<MousePosition>(in.val)) {
+    auto& mp = std::get<MousePosition>(in.val);
+    enabler.tracking_on = mp.tracking_on;
+    gps.mouse_x = mp.mouse_x;
+    gps.mouse_y = mp.mouse_y;
+    gps.precise_mouse_x = mp.pmouse_x;
+    gps.precise_mouse_y = mp.pmouse_y;
   }
+
 
   for (auto& lit : synthetics) {
     if (lit.first.release) pressed_keys.erase(lit.first.match);
