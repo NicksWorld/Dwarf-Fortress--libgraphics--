@@ -875,8 +875,8 @@ class enablerst : public enabler_inputst
 
   // Async rendering
   struct async_cmd {
-    enum cmd_t { pause, start, render, inc, set_fps } cmd;
-    int val; // If async_inc, number of extra frames to run. If set_fps, current value of fps.
+    enum cmd_t { pause, start, render, inc, set_fps, input } cmd;
+    long val; // If async_inc, number of extra frames to run. If set_fps, current value of fps.
     async_cmd() {}
     async_cmd(cmd_t c) { cmd = c; }
   };

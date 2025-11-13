@@ -22,6 +22,15 @@ using namespace std;
 
 enablerst enabler;
 
+// Avoid queuing multiple renders whilst waiting
+bool frame_queued = false;
+uint32_t frame_ready_event = 0;
+
+struct InputEvent {
+	Uint32 now;
+	SDL_Event ev;
+};
+
 // For the printGLError macro
 int glerrorcount = 0;
 
@@ -790,7 +799,11 @@ void enablerst::async_loop() {
             flag &= ~ENABLERFLAG_RENDER;
             update_gfps();
           }
-          async_frombox.write(async_msg(async_msg::complete));
+	  // Push frame ready event into sdl event queue
+	  SDL_Event ev;
+	  SDL_zero(ev);
+	  ev.type = frame_ready_event;
+	  while (!SDL_PushEvent(&ev)) {}
           break;
         case async_cmd::inc:
           async_frames += cmd.val;
@@ -799,6 +812,14 @@ void enablerst::async_loop() {
         case async_cmd::set_fps:
           fps = cmd.val;
           break;
+	case async_cmd::input:
+	  InputEvent* iv = (InputEvent*)cmd.val;
+	  if (ev.type == SDL_TEXTINPUT) {
+		  enabler.set_text_input(iv->ev);
+	  } else {
+		  enabler.add_input(iv->ev, iv->now);
+	  }
+	  delete iv;
         }
       }
     } while (have_cmd);
@@ -846,53 +867,20 @@ void enablerst::do_frame() {
   enabler.clock = SDL_GetTicks();
 
   // If it's time to render..
-  if (outstanding_gframes >= 1) {
+  if (outstanding_gframes >= 1 && !frame_queued) {
     // Get the async-loop to render_things
     async_cmd cmd(async_cmd::render);
     async_tobox.write(cmd);
-    async_wait();
-    // Then finish here
-	if(gps.main_thread_requesting_reshape)
-		{
-		int32_t zf=gps.viewport_zoom_factor;
-
-		renderer->set_viewport_zoom_factor(zf);
-
-		gps.reshape_viewports(zf);
-
-		gps.main_thread_requesting_reshape=false;
-		}
-
-	if(!must_do_render_things_before_display)
-		{
-		if(gps.do_post_init_texture_clear)//needs to be after clean tile cache
-			{
-			enabler.textures.delete_all_post_init_textures();
-
-			gps.do_post_init_texture_clear=false;
-			}
-
-		if(gps.do_clean_tile_cache)
-			{
-			renderer->clean_tile_cache();
-
-			gps.do_clean_tile_cache=false;
-			}
-		renderer->tidy_tile_cache();
-		renderer->display();
-		renderer->render();
-		}
-    gputicks++;
-    outstanding_gframes--;
+    frame_queued = true;
   }
-  // Sleep until the next gframe
-  if (outstanding_gframes < 1) {
-    emit_logs(); // flush game/error logs whenever we have to sleep
-    float fragment = 1 - outstanding_gframes;
-    float milliseconds = fragment / gfps * 1000;
-    // cout << milliseconds << endl;
-    SDL_Delay(milliseconds);
-  }
+  // // Sleep until the next gframe
+  // if (outstanding_gframes < 1) {
+  //   emit_logs(); // flush game/error logs whenever we have to sleep
+  //   float fragment = 1 - outstanding_gframes;
+  //   float milliseconds = fragment / gfps * 1000;
+  //   // cout << milliseconds << endl;
+  //   SDL_Delay(milliseconds);
+  // }
 }
 
 void enablerst::eventLoop_SDL()
@@ -905,6 +893,15 @@ void enablerst::eventLoop_SDL()
   SDL_GetWindowSize(renderer->get_window(), &window_w, &window_h);
   // Initialize the grid
   renderer->resize(window_w, window_h);
+
+  auto send_event = [this](SDL_Event& ev, Uint32 now) {
+	InputEvent* cp = new InputEvent();
+	cp->ev = ev;
+	cp->now = now;
+	async_cmd cmd(async_cmd::cmd_t::input);
+	cmd.val = (long)cp;
+	async_tobox.write(cmd);
+  };
 
   while (loopvar) {
     Uint32 now = SDL_GetTicks();
@@ -925,23 +922,28 @@ void enablerst::eventLoop_SDL()
       else
         renderer->zoom(zoom);
     }
+    if (paused_loop) {
+	    unpause_async_loop();
+	    paused_loop = false;
+    }
 
 	bool any_text_event=false;
 
     // Check for SDL events
     while (SDL_PollEvent(&event)) {
       // Make sure mainloop isn't running while we're processing input
-      if (!paused_loop) {
-        pause_async_loop();
-        paused_loop = true;
-      }
+      // if (!paused_loop) {
+        // pause_async_loop();
+        // paused_loop = true;
+      // }
 	  if (hooks_sdl_event(&event)) continue;
       // Handle SDL events
       switch (event.type) {
 	  case SDL_MOUSEWHEEL:
 		  if (!already_wheeled) {
 			  already_wheeled = true;
-			  enabler.add_input(event, now);
+			  // enabler.add_input(event, now);
+			  send_event(event, now);
 		  }
 		  break;
 	  case SDL_KEYDOWN:
@@ -956,10 +958,11 @@ void enablerst::eventLoop_SDL()
         }
       case SDL_KEYUP:
 	  case SDL_QUIT:
-        enabler.add_input(event, now);
+        // enabler.add_input(event, now);
+	send_event(event, now);
         break;
 	  case SDL_TEXTINPUT:
-		enabler.set_text_input(event);
+	send_event(event, now);
 		any_text_event=true;
 		break;
       case SDL_MOUSEBUTTONDOWN:
@@ -967,6 +970,7 @@ void enablerst::eventLoop_SDL()
         if (!init.input.flag.has_flag(INIT_INPUT_FLAG_MOUSE_OFF)) {
           int isdown = (event.type == SDL_MOUSEBUTTONDOWN);
 
+	  // TODO: These lbut/rbut/lbut_down/rbut_down changes should be an event
           if (event.button.button == SDL_BUTTON_LEFT) {
             enabler.mouse_lbut = isdown;
             enabler.mouse_lbut_down = isdown;
@@ -983,7 +987,8 @@ void enablerst::eventLoop_SDL()
             if (!isdown)
               enabler.mouse_mbut_lift = 0;
           } else
-            enabler.add_input(event, now);
+		  send_event(event, now);
+            // enabler.add_input(event, now);
         }
         break;
       case SDL_MOUSEMOTION:
@@ -1032,6 +1037,41 @@ void enablerst::eventLoop_SDL()
 		}
 		break;
       } // switch (event.type)
+	if (event.type == frame_ready_event) {
+		frame_queued = false;
+		if(gps.main_thread_requesting_reshape)
+			{
+			int32_t zf=gps.viewport_zoom_factor;
+
+			renderer->set_viewport_zoom_factor(zf);
+
+			gps.reshape_viewports(zf);
+
+			gps.main_thread_requesting_reshape=false;
+			}
+
+		if(!must_do_render_things_before_display)
+			{
+			if(gps.do_post_init_texture_clear)//needs to be after clean tile cache
+				{
+				enabler.textures.delete_all_post_init_textures();
+
+				gps.do_post_init_texture_clear=false;
+				}
+
+			if(gps.do_clean_tile_cache)
+				{
+				renderer->clean_tile_cache();
+
+				gps.do_clean_tile_cache=false;
+				}
+			renderer->tidy_tile_cache();
+			renderer->display();
+			renderer->render();
+			}
+	    gputicks++;
+	    outstanding_gframes--;
+	}
     } //while have event
 
     // Update mouse state
@@ -1286,6 +1326,8 @@ int main (int argc, char* argv[]) {
     return 0;
   }
   enabler.renderer_threadid = SDL_ThreadID();
+
+  frame_ready_event = SDL_RegisterEvents(1);
 
   // Spawn simulation thread
   SDL_CreateThread(call_loop, NULL, NULL);
